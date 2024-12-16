@@ -3,11 +3,17 @@ defaults:
 
 arm_server:
   fps: 40
-  buf_time: 0.2
-  v_max: [1.5, 1.5, 1.5]
-  a_max: [10.0, 10.0, 10.0]
-  j_max: [400.0, 400.0, 400.0]
-  urdf: '../roarm_main/roarm_description/urdf/roarm_description.urdf'
-  joints: ['base_link_to_link1', 'link1_to_link2', 'link2_to_link3', 'link3_to_gripper_link']
-  ik_joints: ['base_link_to_link1', 'link1_to_link2', 'link2_to_link3']
+  buf_time: 0.3
+  v_max: [0.15, 0.15, 0.15]
+  a_max: [1.0, 1.0, 1.0]
+  j_max: [40.0, 40.0, 40.0]
+  urdf: "../roarm_main/roarm_description/urdf/roarm_description.urdf"
+  joints:
+    [
+      "base_link_to_link1",
+      "link1_to_link2",
+      "link2_to_link3",
+      "link3_to_gripper_link",
+    ]
+  ik_joints: ["base_link_to_link1", "link1_to_link2", "link2_to_link3"]
   traj_time_rate: 0.5
