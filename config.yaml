@@ -2,11 +2,11 @@ defaults:
   - override hydra/job_logging: disabled
 
 arm_server:
-  fps: 40
-  buf_time: 0.3
-  v_max: [0.15, 0.15, 0.15]
-  a_max: [1.0, 1.0, 1.0]
-  j_max: [40.0, 40.0, 40.0]
+  fps: 50
+  buf_time: 0.9
+  v_max: [1.5, 1.5, 1.5]
+  a_max: [10.0, 10.0, 10.0]
+  j_max: [400.0, 400.0, 400.0]
   urdf: "../roarm_main/roarm_description/urdf/roarm_description.urdf"
   joints:
     [
