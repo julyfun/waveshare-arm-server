@@ -10,8 +10,18 @@ class StaticTransformPublisher(Node):
         super().__init__('static_transform_publisher')
 
         # Define the translation and rotation
-        translation = (-5.5e-2, -6.8e-2, 0.0)
-        rotation_matrix = np.array([[0, 1, 0], [0, 0, -1], [-1, 0, 0]])
+        # x: down
+        # y: back
+        # z: left
+        translation = (-0.13151, +0.01990, +1.5e-2)
+        ang = (90.0 - 67.65) / 180.0 * np.pi
+        rotation_matrix = np.array(
+            [
+                [0, np.cos(ang), np.sin(ang)],
+                [0, np.sin(ang), -np.cos(ang)],
+                [-1, 0, 0]
+            ]
+        )
         
         # Convert rotation matrix to quaternion
         rotation = R.from_matrix(rotation_matrix)

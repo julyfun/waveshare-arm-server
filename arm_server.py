@@ -25,6 +25,7 @@ import pinocchio
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 class TransformRequest(BaseModel):
+    time: float
     frame_id: str
     child_frame_id: str
     xyz: List[float]  # [x, y, z]
@@ -34,13 +35,18 @@ class TransformQuery(BaseModel):
     frame_id: str
     child_frame_id: str
 
-class MoveRequest(BaseModel):
+class MoveArmRequest(BaseModel):
     x: float
     y: float
     z: float
 
 class GripRequest(BaseModel):
     data: float
+
+class WaypointRequest(BaseModel):
+    q0: float
+    q1: float
+    q2: float
 
 
 class RosNode(Node):
@@ -81,9 +87,10 @@ class RosNode(Node):
             self.get_logger().info('No joint state received yet.')
             return None
 
-    def pub_traj(self, q: List):
+    def pub_q_traj(self, q: List):
         msg = JointTrajectory()
         msg.joint_names = self.cfg.joints[:3]
+        assert(len(q) == len(msg.joint_names))
 
         point = JointTrajectoryPoint()
         point.positions = q
@@ -109,8 +116,8 @@ class ArmServer():
         time.sleep(1)
 
         # [ik & itp]
-        self.itp = ItpRingApi(cfg.fps, cfg.buf_time, cfg.v_max, cfg.a_max, cfg.j_max)
-        self.ik = PinoIkSolver(cfg.urdf)
+        self.arm_itp = ItpRingApi(cfg.fps, cfg.buf_time, cfg.v_max[:3], cfg.a_max[:3], cfg.j_max[:3])
+        self.arm_ik = PinoIkSolver(cfg.urdf)
         self.state_q = None
         while self.state_q is None:
             logger.info('state_q Waiting for joint state...')
@@ -122,31 +129,31 @@ class ArmServer():
 
         # [debug]
         self.fps_counter = FpsCounter()
-        threading.Thread(target=self.move_loop).start()
+        threading.Thread(target=self.move_arm_loop).start()
+
 
     # [move]
-    def move_loop(self):
+    def move_arm_loop(self):
         last = time.time()
         while True:
             cur = time.time()
             till = max(cur, last + 1. / self.cfg.fps)
             precise_sleep(till - cur)
             last = till
-            tar = self.itp.ring.pop_front()
+            tar = self.arm_itp.ring.pop_front()
             if len(tar):
-                self.fps_counter.count_and_check('send')
-                self.ros_node.pub_traj(tar.tolist())
-
+                self.fps_counter.count_and_check('move_arm')
+                self.ros_node.pub_q_traj(tar.tolist())
 
     def setup_routes(self):
     # [func]
         @self.app.post("/move-v2")
-        async def move_v2(req: MoveRequest):
+        async def move_v2(req: MoveArmRequest):
 
             x, y, z = req.x, req.y, req.z
             # real
             t_sec = self.ros_node.get_clock().now().nanoseconds / 1e9
-            self.state_q = self.ik.solve_ik(
+            self.state_q = self.arm_ik.solve_ik(
                 move_joints=self.cfg.ik_joints,
                 loss=[
                     ("frame_target",
@@ -156,21 +163,25 @@ class ArmServer():
                         1.0, 0,
                     ),
                 ],
+                # ref_q=np.zeros_like(self.state_q),
                 ref_q=self.state_q,
                 minimize_options={
-                    "maxiter": 6,
+                    "maxiter": 30,
                 },
                 verbose=True,
             )
-            init_q = self.ros_node.get_q()[:3] if self.itp.ring.get_valid_len() == 0 else None
-            self.itp.interpolate(t_sec, self.state_q[:3], init_q, np.zeros_like(self.state_q[:3]))
 
-            tcp = self.ik.get_tcp(self.state_q, ("base_link", pinocchio.pinocchio_pywrap.FrameType.BODY), ("hand_tcp", pinocchio.pinocchio_pywrap.FrameType.BODY))
-            logger.info(f'tcp: {tcp}')
+            init_q = self.ros_node.get_q()[:3] if self.arm_itp.ring.get_valid_len() == 0 else None
+            self.arm_itp.interpolate(t_sec, self.state_q[:3], init_q, np.zeros_like(self.state_q[:3]))
+
+            tcp = self.arm_ik.get_tcp(self.state_q, ("base_link", pinocchio.pinocchio_pywrap.FrameType.BODY), ("hand_tcp", pinocchio.pinocchio_pywrap.FrameType.BODY))
+            logger.info(f'expect: {x, y, z}')
+            logger.info(f'solved: {tcp}')
+            return { "status": "success" }
 
 
         @self.app.post("/move")
-        async def move(req: MoveRequest):
+        async def move(req: MoveArmRequest):
             request = MovePointCmd.Request()
             request.x = req.x
             request.y = req.y
@@ -190,7 +201,7 @@ class ArmServer():
         @self.app.post("/pub-tf2")
         async def pub_tf2(req: TransformRequest):
             transform = TransformStamped()
-            transform.header.stamp = self.ros_node.get_clock().now().to_msg()
+            transform.header.stamp = rclpy.time.Time(seconds=req.time).to_msg()
             transform.header.frame_id = req.frame_id
             transform.child_frame_id = req.child_frame_id
             transform.transform.translation.x = req.xyz[0]
@@ -228,6 +239,18 @@ class ArmServer():
                 }
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
                 return {"status": "error", "message": str(e)}
+
+
+        @self.app.post("/get-q")
+        async def get_q():
+            return {"status": "success", "data": self.ros_node.get_q()[:3].tolist()}
+
+        @self.app.post("/waypoint")
+        async def waypoint(req: WaypointRequest):
+            init_q = self.ros_node.get_q()[:3] if self.arm_itp.ring.get_valid_len() == 0 else None
+            self.arm_itp.interpolate(self.ros_node.get_clock().now().nanoseconds / 1e9, np.array([req.q0, req.q1, req.q2]), init_q, np.zeros_like(init_q))
+            return {"status": "success", "data": [req.q0, req.q1, req.q2]}
+
 
     # [run]
     def run(self):
