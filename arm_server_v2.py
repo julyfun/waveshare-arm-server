@@ -14,15 +14,19 @@ from sensor_msgs.msg import JointState
 from geometry_msgs.msg import TransformStamped
 from rclpy.clock import Clock
 
-from loguru import logger
 from fast_math.itp_state.api import ItpRingApi
 from fast_math.kin.scipy_ik_solver import PinoIkSolver
 from fast_math.time_utils import precise_sleep
 from fast_math.counter import FpsCounter
 import hydra
+import json
+from loguru import logger
 from omegaconf import DictConfig
 import pinocchio
+import serial
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from robotoy.dev import find_device_by_serial
+from robotoy.time_utils import sleep_timer, Once, PassiveTimer
 
 class TransformRequest(BaseModel):
     time: float
@@ -53,55 +57,9 @@ class RosNode(Node):
     def __init__(self, cfg):
         super().__init__('fastapi_ros_node')
         self.cfg = cfg
-        self.move_client = self.create_client(MovePointCmd, '/move_point_cmd')
-        self.grip_publisher = self.create_publisher(Float32, '/gripper_cmd', 10)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
-        # [get q]
-        self.joints_latest = None
-        self.joints_sub =  self.create_subscription(
-            JointState,
-            '/joint_states',
-            self.joints_sub_cb,
-            10)
-
-        # [traj]
-        self.traj_pub = self.create_publisher(JointTrajectory, '/hand_controller/joint_trajectory', 10)
-
-        while not self.move_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for /move_point_cmd service...')
-
-
-    def joints_sub_cb(self, msg):
-        self.joints_latest = msg
-
-    def get_q(self):
-        if self.joints_latest:
-            joint_names = self.joints_latest.name
-            joint_positions = self.joints_latest.position
-            joint_states = {name: position for name, position in zip(joint_names, joint_positions)}
-            return np.array([joint_states[name] for name in self.cfg.joints])
-        else:
-            self.get_logger().info('No joint state received yet.')
-            return None
-
-    def pub_q_traj(self, q: List):
-        msg = JointTrajectory()
-        msg.joint_names = self.cfg.joints[:3]
-        assert(len(q) == len(msg.joint_names))
-
-        point = JointTrajectoryPoint()
-        point.positions = q
-        time_from_start = self.cfg.traj_time_rate * (1. / self.cfg.fps)
-        point.time_from_start.sec = int(time_from_start)
-        point.time_from_start.nanosec = int((time_from_start - int(time_from_start)) * 1e9)
-
-        msg.points.append(point)
-
-        self.traj_pub.publish(msg)
-
 
 class ArmServer():
     def __init__(self, cfg: DictConfig):
@@ -115,45 +73,95 @@ class ArmServer():
         thread.start()
         time.sleep(1)
 
-        # [ik & itp]
+        # [debug]
+        self.fps_counter = FpsCounter()
+        self.once = Once()
+
+        # [itp ring]
         self.arm_itp = ItpRingApi(cfg.fps, cfg.buf_time, cfg.v_max[:3], cfg.a_max[:3], cfg.j_max[:3])
-        self.arm_ik = PinoIkSolver(cfg.urdf)
-        self.state_q = None
-        while self.state_q is None:
-            logger.info('state_q Waiting for joint state...')
+
+        # [arm serial]
+        #
+        self.rw_lock = threading.Lock()
+
+        port = find_device_by_serial(cfg.arm_serial)
+        self.ser = serial.Serial(port, baudrate=115200, dsrdtr=None)
+        self.ser.setRTS(True)
+        self.ser.setDTR(True)
+
+        self.cache_q = None
+        threading.Thread(target=self.read_loop, daemon=True).start()
+        threading.Thread(target=self.write_feedback_loop, daemon=True).start()
+        threading.Thread(target=self.write_move_loop, daemon=True).start()
+
+        while self.cache_q is None:
+            logger.info('Waiting for arm serial...')
             time.sleep(0.1)
-            self.state_q = self.ros_node.get_q()
+
+
+        # [ik & itp]
+        self.arm_ik = PinoIkSolver(cfg.urdf)
+        self.arm_ik_state_q = self.cache_q
+        logger.info(f"Initial state q: {self.arm_ik_state_q}")
 
         # [app]
         self.setup_routes()
 
-        # [debug]
-        self.fps_counter = FpsCounter()
-        threading.Thread(target=self.move_arm_loop).start()
+        # threading.Thread(target=self.move_arm_loop).start()
 
+    def read_loop(self):
+        logger.info("read loop started")
+        def fn():
+            if not self.ser.in_waiting:
+                return
+            try:
+                with self.rw_lock:
+                    data = self.ser.readline().decode('utf-8')
+                data = json.loads(data)
+                if data.get('T') == 1051:
+                    self.cache_q = np.array(
+                        [
+                            -data.get('b'),
+                            -data.get('s'),
+                            data.get('e'),
+                            data.get('t'),
+                        ]
+                    )
+            except json.JSONDecodeError as e:
+                ... # ok
+            except Exception as e:
+                logger.error(f"Error: {e}")
+        sleep_timer(0.005, fn)
 
-    # [move]
-    def move_arm_loop(self):
-        last = time.time()
-        while True:
-            cur = time.time()
-            till = max(cur, last + 1. / self.cfg.fps)
-            precise_sleep(till - cur)
-            last = till
+    def write_feedback_loop(self):
+        def fn():
+            with self.rw_lock:
+                self.ser.write('{"T":105}'.encode() + b'\n')
+                self.once.try_act(lambda: logger.info(f"write 105"), '105')
+        sleep_timer(0.05, fn)
+
+    def write_move_loop(self):
+        def fn():
             tar = self.arm_itp.ring.pop_front()
             if len(tar):
-                self.fps_counter.count_and_check('move_arm')
-                self.ros_node.pub_q_traj(tar.tolist())
+                with self.rw_lock:
+                    self.once.try_act(lambda: logger.info(f"write 101 move: {tar}"), '101')
+                    dir = [-1, -1, 1]
+                    for i, q in enumerate(tar):
+                        logger.info(f'{{"T":101,"joint":{i + 1},"rad":{q * dir[i]},"spd":0,"acc":0}}')
+                        self.ser.write(f'{{"T":101,"joint":{i + 1},"rad":{q * dir[i]},"spd":0,"acc":0}}'.encode() + b'\n')
+
+        sleep_timer(1. / self.cfg.fps, fn)
 
     def setup_routes(self):
     # [func]
-        @self.app.post("/move-v2")
-        async def move_v2(req: MoveArmRequest):
+        @self.app.post("/move")
+        async def move_v3(req: MoveArmRequest):
 
             x, y, z = req.x, req.y, req.z
             # real
-            t_sec = self.ros_node.get_clock().now().nanoseconds / 1e9
-            self.state_q = self.arm_ik.solve_ik(
+            t_sec = time.time()
+            self.arm_ik_state_q = self.arm_ik.solve_ik(
                 move_joints=self.cfg.ik_joints,
                 loss=[
                     ("frame_target",
@@ -164,31 +172,22 @@ class ArmServer():
                     ),
                 ],
                 # ref_q=np.zeros_like(self.state_q),
-                ref_q=self.state_q,
+                ref_q=self.arm_ik_state_q,
                 minimize_options={
                     "maxiter": 30,
                 },
                 verbose=True,
             )
 
-            init_q = self.ros_node.get_q()[:3] if self.arm_itp.ring.get_valid_len() == 0 else None
-            self.arm_itp.interpolate(t_sec, self.state_q[:3], init_q, np.zeros_like(self.state_q[:3]))
+            init_q = self.cache_q[:3] if self.arm_itp.ring.get_valid_len() == 0 else None
+            self.arm_itp.interpolate(t_sec, self.arm_ik_state_q[:3], init_q, np.zeros_like(self.arm_ik_state_q[:3]))
 
-            tcp = self.arm_ik.get_tcp(self.state_q, ("base_link", pinocchio.pinocchio_pywrap.FrameType.BODY), ("hand_tcp", pinocchio.pinocchio_pywrap.FrameType.BODY))
+            tcp = self.arm_ik.get_tcp(self.arm_ik_state_q, ("base_link", pinocchio.pinocchio_pywrap.FrameType.BODY), ("hand_tcp", pinocchio.pinocchio_pywrap.FrameType.BODY))
             logger.info(f'expect: {x, y, z}')
             logger.info(f'solved: {tcp}')
+            logger.info(f'q: {self.arm_ik_state_q}')
             return { "status": "success" }
 
-
-        @self.app.post("/move")
-        async def move(req: MoveArmRequest):
-            request = MovePointCmd.Request()
-            request.x = req.x
-            request.y = req.y
-            request.z = req.z
-
-            future = self.ros_node.move_client.call(request)
-            return {"status": "success", "data": [req.x, req.y, req.z]}
 
         @self.app.post("/grip")
         async def grip(req: GripRequest):

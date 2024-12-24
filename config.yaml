@@ -4,9 +4,11 @@ defaults:
 arm_server:
   fps: 50
   buf_time: 0.3
-  v_max: [3.0, 3.0, 3.0]
-  a_max: [15.0, 15.0, 15.0]
-  j_max: [600.0, 600.0, 600.0]
+  arm_serial: "Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_80adf99a68e4ee118a2091844c11a646"
+  v_max: [1.0, 1.0, 1.0]
+  a_max: [5.0, 5.0, 5.0]
+  j_max: [150.0, 150.0, 150.0]
+  vaj_factor: 1.0
   urdf: "../roarm_main/roarm_description/urdf/roarm_description.urdf"
   joints:
     [
